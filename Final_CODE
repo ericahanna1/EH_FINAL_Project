@@ -53,8 +53,10 @@ map_CoDomPerc <- tm_shape(VRI) +
   tm_polygons(col = "SPECIES__6",
               title = "Percentage of Co-Dominent Species",
               style = "fisher",
-              palette = "viridis", n = 6) +
-  tm_legend(legend.position = c("LEFT", "BOTTOM"))
+              palette = "Greens", n = 5) + 
+  tm_legend(legend.position = c("LEFT", "BOTTOM"))+ 
+  tm_scale_bar(text.size = 0.8, position = "center") +
+  tm_compass(north = 0 , position = c("right", "top"))
 
 map_CoDomPerc
 

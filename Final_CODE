@@ -1,0 +1,451 @@
+nstall.packages("spgwr")
+install.packages("spdep")
+install.packages("spDataLarge")
+
+#Libraries
+library(spgwr)
+library(spatstat)
+library(tmap)
+library(gstat)
+library(sf)
+library(raster)
+library(rgdal)
+library(e1071)
+library(spdep)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(grid)
+library(gtable)
+library(plyr)
+
+#Set working directory
+dir <- "VRI"
+setwd(dir)
+dir
+#Reading in elevation dataset
+elev <- readOGR("ElevSample.shp") #Read in data
+elev <- spTransform(elev, CRS("+init=epsg:26910"))
+
+#Reading in VRI data
+VRI <- readOGR("WatershedVRI.shp") #Read in shapefile
+VRI <- spTransform(VRI, CRS("+init=epsg:26910"))
+head(VRI@data)
+
+vriCleanCols <- c("FID_VEG_CO", "POLYGON_ID", "PROJ_AGE_1",
+                  "SITE_INDEX", "SPECIES__4", "SPECIES__5",
+                  "PROJ_HEI_1", "SPECIES_PC", "SPECIES__6",
+                  "VRI_LIVE_S", "BASAL_AREA", "WHOLE_STEM",
+                  "CROWN_CL_1")
+vriClean <- VRI[,vriCleanCols]
+
+Names <- c("FID", "PolyID", "Stand_Age", "Site_Index",
+           "CoDom_Sp", "Dom_Sp", "Stand_HT", "DomSP_Perc", 
+           "CDomSP_Perc", "Stand_Dens", "Stand_BA", "Stand_StemBio", "Stand_CrownCl")
+
+colnames(vriClean@data) <- Names
+head(vriClean@data)
+
+
+#Create choropleth map of height
+
+map_CoDomPerc <- tm_shape(VRI) +
+  tm_polygons(col = "SPECIES__6",
+              title = "Percentage of Co-Dominent Species",
+              style = "fisher",
+              palette = "viridis", n = 6) +
+  tm_legend(legend.position = c("LEFT", "BOTTOM"))
+
+map_CoDomPerc
+
+
+
+#Create a grid called grd to use in your interpolation
+# Create an empty grid where n is the total number of cells
+grd <- as.data.frame(spsample(elev, "regular", n=50000))
+names(grd)       <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+gridded(grd)     <- TRUE  # Create SpatialPixel object
+fullgrid(grd)    <- TRUE  # Create SpatialGrid object
+proj4string(grd) <- proj4string(elev)
+
+
+proj4string(grd)
+
+
+###############################################
+#DESCRIPTIVE STATISTICS
+
+#Co-dominent Species %
+range.CDom_Perc <- range(vriClean$CDomSP_Perc)
+mean.CDom_Perc <- mean(vriClean$CDomSP_Perc, na.rm = TRUE)
+sd.CDom_Perc <- sd(vriClean$CDom_Perc, na.rm = TRUE)
+mode.CDom_Perc <- mode(vriClean$CDomSP_Perc)
+median.CDom_Perc <- median(vriClean$CDomSP_Perc, na.rm = TRUE)
+skew.CDom_Perc <- skewness(vriClean$CDomSP_Perc, na.rm = TRUE)
+kurt.CDom_Perc <- kurtosis(vriClean$CDomSP_Perc, na.rm = TRUE)
+CoV.CDom_Perc <- (sd.CDom_Perc/ mean.CDom_Perc) * 100
+normPop.CDom_Perc <- ks.test(vriClean$CDomSP_Perc, y = "pnorm", alternative = "less")
+hist(vriClean$CDomSP_Perc, breaks = 10,)
+
+range.CDom_Perc
+mean.CDom_Perc
+sd.CDom_Perc
+mode.CDom_Perc
+median.CDom_Perc
+skew.CDom_Perc
+kurt.CDom_Perc
+CoV.CDom_Perc
+normPop.CDom_Perc
+
+
+
+###########################SPATIAL INTERPOLATION
+tmaptools::palette_explorer() #Tool for selecting palettes
+#IDW Interpolation
+P.idw <- gstat::idw(grid_code~1, elev, newdata=grd, idp=3.9)
+r       <- raster(P.idw)
+r.m     <- mask(r, vriClean)
+
+tm_shape(r.m) + 
+  tm_raster(n=10,palette = "-Spectral",
+            title="Elevation (m)") + 
+  tm_shape(elev) + tm_dots(size=0.1) +
+  tm_legend(legend.outside= FALSE, legend.position = c("left", "bottom"))+ tm_layout(inner.margins = 0.05) +
+  tm_scale_bar(text.size = 0.8, position = "center") +
+  tm_compass(north = 0 , position = c("right", "top"))
+
+
+
+#################################################
+# Leave-one-out validation routine
+IDW.out <- vector(length = length(elev))
+for (i in 1:length(elev)) {
+  IDW.out[i] <- idw(grid_code ~ 1, elev[-i,], elev[i,], idp=3.9)$var1.pred}
+
+# Plot the differences
+OP <- par(pty="s", mar=c(4,3,0,0))
+plot(IDW.out ~ elev$grid_code, asp=1, xlab="Observed", ylab="Predicted", pch=16,
+     col=rgb(0,0,0,0.5))
+abline(lm(IDW.out ~ elev$grid_code), col="red", lw=2,lty=2)
+abline(0,1)
+par(OP)
+sqrt( sum((IDW.out - elev$grid_code)^2) / length(elev))
+
+
+#################################################
+# Implementation of a jackknife technique to estimate a confidence interval at each unsampled point.
+# Create the interpolated surface
+img <- gstat::idw(grid_code ~1, elev, newdata=grd, idp=3.9)
+n   <- length(elev)
+Zi  <- matrix(nrow = length(img$var1.pred), ncol = n)
+
+# Remove a point then interpolate (do this n times for each point)
+st <- stack()
+for (i in 1:n){
+  Z1 <- gstat::idw(grid_code~1, elev[-i,], newdata=grd, idp=3.9)
+  st <- addLayer(st,raster(Z1,layer=1))
+  # Calculated pseudo-value Z at j
+  Zi[,i] <- n * img$var1.pred - (n-1) * Z1$var1.pred 
+}
+
+# Jackknife estimator of parameter Z at location j
+Zj <- as.matrix(apply(Zi, 1, sum, na.rm=T) / n )
+
+# Compute (Zi* - Zj)^2
+c1 <- apply(Zi,2,'-',Zj)            # Compute the difference
+c1 <- apply(c1^2, 1, sum, na.rm=T ) # Sum the square of the difference
+
+# Compute the confidence interval
+CI <- sqrt( 1/(n*(n-1)) * c1)
+CI
+
+# Create (CI / interpolated value) raster
+img.sig   <- img
+img.sig$v <- CI /img$var1.pred 
+
+# Clip the confidence raster to Southern California
+r <- raster(img.sig, layer="v")
+r.m.CI <- mask(r, vriClean)
+
+# Plot the map
+tm_shape(r.m.CI) + tm_raster(n=7, title="95% confidence interval of elevation (m)", palette = "PuRd") +
+  tm_shape(elev) + tm_dots(size=0.1) +
+  tm_legend(legend.outside=FALSE, legend.position = c("left", "bottom"), legend.text.size = 0.8)+
+  tm_layout(inner.margins = 0.05) + tm_scale_bar(text.size = 0.8, position = "center") +
+  tm_compass(north = 0 , position = c("right", "top"))
+
+
+
+
+##################################################################################################
+#####SPATIAL AUTO CORRELATION:
+##Defining our neighborhoods by QUeens and Rooks Analysis for our whole dataset(?)
+vri.nb <- poly2nb(vriClean)
+vri.net <- nb2lines(vri.nb, coords=coordinates(vriClean))
+crs(vri.net) <- crs(vriClean)
+tm_shape(vriClean) + tm_borders(col='lightgrey') + 
+  tm_shape(vri.net) + tm_lines(col='red')
+
+
+vri.nb2 <- poly2nb(vriClean, queen = FALSE) ###Rook
+vri.net2 <- nb2lines(vri.nb2, coords=coordinates(vriClean))
+crs(vri.net2) <- crs(vriClean)
+
+tm_shape(vriClean) + tm_borders(col='lightgrey') + ####defineing our neighbors
+  tm_shape(vri.net) + tm_lines(col='blue', lwd = 2) + ###queens in blue
+  tm_shape(vri.net2) + tm_lines(col='orange', lwd = 2) #rooks in orange
+
+######################## create weights for our nieghbors matrix 1 = neighbor 0= not
+vri.lw <- nb2listw(vri.nb, zero.policy = TRUE, style = "W")
+print.listw(vri.lw, zero.policy = TRUE)
+
+
+########################  Local Morans --LISA TESt
+lisa.test_CoDomPerc <- localmoran(vriClean$CDomSP_Perc, vri.lw)
+Stand_CDom_Perc$Ii <- lisa.test_CoDomPerc[,1]
+Stand_CDom_Perc$E.Ii<- lisa.test_CoDomPerc[,2]
+Stand_CDom_Perc$Var.Ii<- lisa.test_CoDomPerc[,3]
+Stand_CDom_Perc$Z.Ii<- lisa.test_CoDomPerc[,4]
+Stand_CDom_Perc$P<- lisa.test_CoDomPerc[,5]
+
+########################
+tmaptools::palette_explorer() #Tool for selecting pallettes
+map_LISA_CDom_Perc <- tm_shape(Stand_CDom_Perc) + 
+  tm_polygons(col = "Z.Ii", 
+              title = "Z-scores for Local Moran's I: Percent of Co-dominent Species", 
+              style = "fixed", breaks = c(-Inf, -1.96, 0, 1.96, Inf), 
+              palette = "-PiYG", n = 6) + tm_legend(legend.text.size = 0.8)+
+  tm_scale_bar(text.size = 0.8, position = "center") +
+  tm_compass(north = 0 , position = c("right", "top"))
+
+map_LISA_CDom_Perc
+
+
+
+########################
+moran.plot(vriClean$CDomSP_Perc, vri.lw, zero.policy=TRUE, spChk=NULL, labels=NULL, xlab="Spatial Lag", 
+           ylab="Percent of Co-dominent Species", col = "blue", quiet=NULL)
+
+moran.plot(vriClean$Stand_Age, vri.lw, zero.policy=TRUE, spChk=NULL, labels=NULL, xlab="Spatial Lag ", 
+           ylab="Stand Age",  col = "Purple", quiet=NULL,)
+
+png("T.png")
+map_TM
+dev.off()
+
+
+#######POINT PATTERN ANALYSIS
+#####
+library(plyr)
+library(spatstat)
+
+kma <- elev
+kma$x <- coordinates(kma)[,1]
+kma$y <- coordinates(kma)[,2]
+
+#check for and remove duplicated points
+#first, finds zero distance among points to see if there are any duplicates
+zd <- zerodist(kma)
+zd
+
+#if there are duplicates, remove them
+
+kma <-remove.duplicates(kma)
+
+#create an "extent" object which can be used to create the observation window for spatstat
+
+kma.ext <- as.matrix(extent(kma))
+
+#observation window (Aka Study AREA???)
+
+window <- as.owin(list(xrange = kma.ext[1,], yrange = kma.ext[2,]))
+window
+
+#create ppp oject from spatstat
+kma.ppp <- ppp(x = kma$x, y=kma$y, window= window)
+View(kma.ppp)
+
+########################K-FUNCTION 
+#basic k-function
+k.fun<- Kest(kma.ppp, correction = "Ripley")
+plot(k.fun)
+
+#use simulation to test the point pattern against CSR
+k.fun.e. <- envelope(kma.ppp, Kest, nsim = 99, correction = "Ripley", main = "K-function: Percent of Co-dominent Species ")
+k.fun.e.
+
+plot(k.fun.e.)
+
+png("Co-dominent Species Percent.png")
+plot(k.fun.e.CDP)
+dev.off()
+
+###COMBINING DATA
+#Convert your interpolation into a raster and map it:
+r <- raster(r.m)
+sufaceMap <- tm_shape(r.m) + 
+  tm_raster(n=5,palette = "-Spectral",
+            title="Elevation (m)") + tm_legend(legend.position = c("left", "bottom"), legend.text.size = 1.1) + tm_scale_bar(position = c("center"), text.size = 0.8)+
+  tm_compass(north = 0 , position = c("right", "top"))+ tm_layout(inner.margins = 0.05)+
+  tm_shape(elev) + tm_dots(size=0.1)
+sufaceMap
+
+#If you have too many cells, 
+#you can reduce the number by aggregating values
+#agg <- aggregate(yourRasterFromKriging, fact=??, fun=mean)
+
+#Extract average elev for each polygon
+vriClean$Elev <- extract(r.m, vriClean, fun = mean)[,1]
+
+
+
+######Linear Regression##########
+#Let's say your dataset with both Elev and Height are stored in a dataset called VRI.
+#Plot Height and Elev from the VRI dataset you created
+plot(vriClean$CDomSP_Perc ~ vriClean$Elev)
+
+#Notice that there are a lot of 0's in this dataset. If you decide to remove them, use the following line:
+VRI.no0 <-  vriClean[which(vriClean$CDomSP_Perc > 0), ]
+VRI.no0 <-  VRI.no0[which(VRI.no0$Elev > 0), ]
+
+#Now plot the data again
+plot(VRI.no0$CDomSP_Perc ~ VRI.no0$Elev)
+
+#Perform a linear regression on the two variables. You should decide which one is dependent.
+lm.model.CDomSP_Perc <- lm(VRI.no0$CDomSP_Perc ~ VRI.no0$Elev)
+
+#Add the regression model to the plot you created
+plot(VRI.no0$CDomSP_Perc ~ VRI.no0$Elev)
+abline(lm.model.CDomPerc, col = "red")
+
+
+#Get the summary of the results
+summary(lm.model.CDomSP_Perc)
+
+
+#add the fitted values to your spatialpolygon dataframe
+VRI.no0$predictlm <- lm.model.CDomSP_Perc$fitted.values
+
+#You want to determine if the model residuals are spatially clustered. 
+#add the residuals to your spatialpolygon dataframe
+VRI.no0$residuals <- residuals.lm(lm.model.CDomSP_Perc)
+
+#Observe the result to make sure it looks correct
+head(VRI.no0@data)                #Co-Dominent Speces Percent
+
+#Now, create choropleth map of residuals
+tmaptools::palette_explorer() #Tool for selecting palettes
+map_resid <- tm_shape(VRI.no0) +
+  tm_polygons(col = "residuals",
+              title = "Co-dominent Species Percent Residuals",
+              style = "fisher",
+              palette = "inferno", n = 6, midpoint = -12.80)+ tm_layout(inner.margins = 0.05) +
+  tm_scale_bar(text.size = 0.8, position = "center") +
+  tm_compass(north = 0 , position = c("right", "top"))+ tm_legend(legend.text.size = 0.8)
+
+map_resid
+
+
+##################################################
+##SPATIAL AUTO CORRELATION of Residuals
+
+vri.reg <- poly2nb(VRI.no0)  ####FOR co-dominent species
+vri.net.reg <- nb2lines(vri.reg, coords=coordinates(VRI.no0))
+crs(vri.net.reg) <- crs(VRI.no0)
+
+
+# create weights for our nieghbors matrix 1 = neighbor 0= not
+vri.lw.reg <- nb2listw(vri.reg, zero.policy = TRUE, style = "W")
+print.listw(vri.lw.reg, zero.policy = TRUE)
+
+#####GLOBAL MORANS
+mi_Reg <- moran.test(VRI.no0$residuals, vri.lw.reg, zero.policy = TRUE)
+mi_Reg  #Moran I statistic       Expectation          Variance 
+########################0.2054495683     -0.0002411382      0.0001175194 
+norm_Reg <- shapiro.test(VRI.no0$CDomSP_Perc)
+norm_Reg.P <- shapiro.test(VRI.no0$CDomSP_Perc)$p.value
+
+plot(VRI.no0$CDomSP_Perc)
+
+moran.range <- function(vri.lw.reg) {
+  wmat <- listw2mat(vri.lw.reg)
+  return(range(eigen((wmat + t(wmat))/2)$values))
+}
+moran.range(vri.lw.reg)
+
+mi_CoDomPerc <- mi_Reg$estimate[[1]]
+eI_CoDomPerc <- mi_Reg$estimate[[2]]
+var_CoDomPerc <- mi_Reg$estimate[[3]]
+z_CoDomPerc <- (mi_CoDomPerc - eI_CoDomPerc) / sqrt(var_CoDomPerc)
+
+
+###########
+moran.plot(VRI.no0$CDomSP_Perc, vri.lw.reg, zero.policy=TRUE, spChk=NULL, labels=NULL, xlab="Spatial Lag", 
+           ylab="Redisuals of Percent of Co-dominent Species", col = "blue", quiet=NULL)
+
+
+png("T.png")
+map_TM
+dev.off()
+
+
+####Geographically Weighted Regression
+#Let's say you are continuing with 
+#your data from the regression analysis. 
+#The first thing you need to do is to add the 
+#polygon coordinates to the spatialpolygondataframe.
+#You can obtain the coordinates using the 
+#"coordinates" function from the sp library
+VRI.no0.coords <- sp::coordinates(VRI.no0)
+
+VRI.coords <- sp::coordinates(vriClean)
+#Observe the result:
+head(VRI.no0.coords)
+head(VRI.coords)
+
+#Now add the coordinates back to the spatialpolygondataframe
+VRI.no0$X <- VRI.no0.coords[,1]
+VRI.no0$Y <- VRI.no0.coords[,2]
+
+VRI.coords$X <- VRI.coords[,1]
+VRI.coords$Y <- VRI.coords[,2]
+View(VRI.coords)
+
+View(VRI.no0.coords)
+VRI.no0$X
+VRI.no0$Y
+
+###Determine the bandwidth for GWR: this will take a while
+GWRbandwidth <- gwr.sel(VRI.no0$CDomSP_Perc ~ VRI.no0$Elev, 
+                        data=VRI.no0, coords=cbind(VRI.no0.coords$X,VRI.no0.coords$Y),adapt=T) 
+
+###Perform GWR on the two variables with the bandwidth determined above
+###This will take a looooooong while
+gwr.model = gwr(VRI.no0$CDomSP_Perc ~ VRI.no0$Elev, 
+                data=VRI.no0, coords=cbind(VRI.no0.coords$X,VRI.no0.coords$Y), 
+                adapt=GWRbandwidth, hatmatrix=TRUE, se.fit=TRUE) 
+
+#Print the results of the model
+gwr.model
+
+#Look at the results in detail
+results<-as.data.frame(gwr.model$SDF)
+head(results)
+
+#Now for the magic. Let's add our local r-square values to the map
+VRI.no0$localr <- results$localR2
+VRI.no0$localr
+#Create choropleth map of r-square values
+tmaptools::palette_explorer() #Tool for selecting palettes
+
+map_r2 <- tm_shape(VRI.no0) +
+  tm_polygons(col = "localr",
+              title = "R2 values ",
+              style = "fisher",
+              palette = "-plasma", n = 6, midpoint = 0.44) +
+  tm_scale_bar(text.size = 0.8, position = "center") +
+  tm_compass(north = 0 , position = c("right", "top"))
+
+map_r2
+
